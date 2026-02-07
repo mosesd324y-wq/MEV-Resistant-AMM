@@ -44,6 +44,11 @@
     { price-cumulative: uint, timestamp: uint }
 )
 
+(define-map settled-orders
+    { batch-id: uint, user: principal, order-id: uint }
+    bool
+)
+
 (define-private (get-user-order-count (batch-id uint) (user principal))
     (default-to u0 (map-get? user-order-count { batch-id: batch-id, user: user }))
 )
@@ -203,24 +208,32 @@
     )
 )
 
-(define-public (claim-order (batch-id uint) (order-id uint) (token-out <sip-010-trait>))
+(define-public (settle-order (batch-id uint) (order-id uint) (token-in <sip-010-trait>) (token-out <sip-010-trait>))
     (let
         (
             (order (unwrap! (map-get? orders { batch-id: batch-id, user: tx-sender, order-id: order-id }) ERR-NO-ORDERS))
             (batch (unwrap! (map-get? batch-info { batch-id: batch-id }) ERR-BATCH-NOT-READY))
-            (price (get clearing-price batch))
-            (finalized (get finalized batch))
+            (is-settled (default-to false (map-get? settled-orders { batch-id: batch-id, user: tx-sender, order-id: order-id })))
         )
-        (asserts! finalized ERR-BATCH-NOT-READY)
-        
+        (asserts! (get finalized batch) ERR-BATCH-NOT-READY)
+        (asserts! (not is-settled) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (contract-of token-in) (get token-in order)) ERR-INVALID-AMOUNT)
+
+        (map-set settled-orders { batch-id: batch-id, user: tx-sender, order-id: order-id } true)
+
         (let
             (
+                (price (get clearing-price batch))
                 (input-amount (get sell-amount order))
                 (output-amount (/ (* input-amount price) SCALE-FACTOR))
+                (min-out (get min-out order))
             )
-            (asserts! (>= output-amount (get min-out order)) ERR-SLIPPAGE-EXCEEDED)
-            (try! (as-contract (contract-call? token-out transfer output-amount tx-sender (get user order) none)))
-            (ok output-amount)
+            ;; If output amount meets minimum or price is favorable, execute swap
+            ;; Otherwise, refund the original input amount
+            (if (>= output-amount min-out)
+                (as-contract (contract-call? token-out transfer output-amount tx-sender (get user order) none))
+                (as-contract (contract-call? token-in transfer input-amount tx-sender (get user order) none))
+            )
         )
     )
 )
